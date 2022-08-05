@@ -1,0 +1,621 @@
+---
+title: "RNA-seq analysis of glioma combination drug therapies"
+author:
+- name: "Marina Vallejo"
+  affiliation: Universitat Pompeu Fabra
+  email: marina.vallejo01@estudiant.upf.edu
+- name: "Maria Artigues"
+  affiliation: Universitat Pompeu Fabra
+  email: maria.artigues01@estudiant.upf.edu
+- name: "Pau Torren"
+  affiliation: Universitat Pompeu Fabra
+  email: pau.torren01@estudiant.upf.edu
+- name: "Sara Vega"
+  affiliation: Universitat Pompeu Fabra
+  email: sara.vega02@estudiant.upf.edu
+date: "`r Sys.Date()`"
+output:
+  BiocStyle::html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    fig_captions: yes
+bibliography: bibliography.bib
+nocite: '@*'
+vignette: >
+  %\VignetteIndexEntry{IEOprojectAnalysis}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, echo=FALSE, cache=FALSE}
+library(knitr) ## kable()
+library(kableExtra) ## kable_styling(), save_kable()
+library(usethis) ## use_directory(), proj_path()
+
+knitr::opts_chunk$set(
+  collapse=TRUE,
+  comment="",
+  fig.align="center",
+  cache=FALSE
+)
+
+## this option avoid use_directory() being verbose later on
+options(usethis.quiet=TRUE)
+```
+
+```{r message=FALSE, warning=FALSE, cache=FALSE, include=FALSE}
+devtools::document()
+
+library(BiocStyle)
+library(SummarizedExperiment)
+library(edgeR)
+library(geneplotter)
+library(sva)
+library(fgsea)
+
+if (!require("RColorBrewer")) install.packages("RColorBrewer")
+library(RColorBrewer)
+
+if (!require("msigdbr")) install.packages("msigdbr")
+library(msigdbr)
+
+```
+
+# Introduction
+
+[**Diffuse Midline Gliomas (DMGs)**](https://www.cancer.gov/rare-brain-spine-tumor/tumors/diffuse-midline-gliomas) are a type of lethal tumours that affect the glial cells. In this study, they focus on a subtype of DMGs, **Diffuse Intrinsic Pontine Gliomas (DIPG)**. They tend to have quick growth so children affected are usually diagnosed very soon. Despite the early diagnosis, the median overall survival is only 9-10 months, as nowadays treatment is limited to radiotherapy.
+
+In the recent years, **Panobinostat** has been reported as a promising treatment drug for this disease. Nevertheless, in DIPG preclinical studies with this drug, resistances have arised. The aim of this study is to characterize combinational drug therapy and find new vulnerabilities in these kind of cancers. For this, the authors perform a **High-throughput drug screening** and, later on, a **RNA-Seq experiment** with the most promising drug combinations [@lin19]. In this context, the **transcriptional data** allows to characterize the metabolic state of the DIPG models under different drugs and identify the underlying metabolic effects.
+
+
+# Quality assessment
+
+Before starting with the analysis, it is important to perform a **Quality assessment**. This collection of steps will allow us to understand our data and get rid of those samples that do not meet the quality standards.
+
+## Data import and cleaning
+
+First of all, we will import the raw table of counts available in  [**.rds**](https://functionalgenomics.upf.edu/courses/IEO/projects/datasets/GSE123278.rds) format.
+
+```{r, message=FALSE}
+se <- readRDS(file.path(system.file("extdata",
+                                    package="IEOprojectGlioma"),
+                        "GSE123278.rds"))
+se
+```
+
+Data is stored in a **RangedSummarizedExperiment** class. It is a sort of matrix container where the columns are samples, and rows are features of interest. We have a total of **`r nrow(se)` genes** and  **`r ncol(se)` samples**. 
+
+Now we are going to explore **rowData**:
+```{r}
+cat("Dimensions: ", dim(rowData(se)),"\n","\n") # check dimensions
+
+head(rowData(se)) # get first rows
+```
+
+Note that **gene id** is encoded using Stable IDs, which follow the pattern: **ENS/species prefix/feature type prefix/a unique eleven digit number**. They also provide a short gene description, among others.
+
+Now we are going to explore **colData**:
+```{r}
+cat("Dimensions: ", dim(colData(se)),"\n","\n")
+head(colData(se), n=5) 
+```
+ 
+**colData** contains phenotypic data. At the beginning we can check that our data set has **37 phenotypic variables** (columns).
+
+Note that there's the column **geo_accession**, which contains **GSM** identifiers. These identifiers can be used in order to check if there are any technical replicates, as they define individual samples. 
+
+Now we will check if there are **technical replicates**:
+```{r}
+length(unique(se$geo_accession))
+table(lengths(split(colnames(se), se$geo_accession)))
+```
+
+Our data set doesn't have any technical replicates, there are no repetitions in the **geo_accession** variable. 
+
+Convert to DGEList and check data dimensions:
+```{r, message=FALSE, warning=FALSE}
+dge <- DGEList(counts=assays(se)$counts, genes=rowData(se))
+
+cat("Dimensions: ",dim(dge))
+```
+
+As we are working with **RNA expression** data, we can calculate the expression units. They can be seen as a digital measure to quantify the abundance of transcripts. **log2 counts per million reads mapped (CPM)**, consists in counting the sequenced fragments scaled by the total number of reads and multiplied by a million.
+
+Calculate **log2 CPM**:
+```{r message=FALSE}
+assays(se)$logCPM <- cpm(dge, log=TRUE) # logical, if TRUE then log2 values are returned.
+assays(se)$logCPM[1:5, 1:5] # check the 5 top rows
+```
+ 
+Check other categorical variables that contain further information about the experiment:
+
+- `cell type:ch1` &rarr; cell type
+
+- `agent:ch1` &rarr; treatment received 
+
+<!-- &rarr; = right arrow -->
+
+Create a table containing these 2 variables:
+
+
+```{r table, echo=FALSE}
+kable(table(se$`agent:ch1`, se$`cell type:ch1`), caption = "<b>Number of samples for each cell type and treatment.</b>Columns show different cell lines, rows show different treatments.", format = "html") %>% kable_styling(position = "center")
+```
+
+In the Table \@ref(tab:table) we have  **treatment** as rows and **cell line** as columns, with 5 and 3 levels each one.
+
+Further information about the **cell lines** (sex/diagnosis age/survival/tumor type/tissue obtention/prior therapy):
+
+- **DIPG13**: 6 years / F / 4 months /  DIPG, WHO grade IV / postmortem autopsy / XRT
+
+- **QCTB-R059**: 10 years / F /  1 month /  Pediatric GBM, WHO grade IV / surgical resection / None
+
+- **SU-DIPG-6**: 7 years / F /  6 months /  DIPG, WHO grade III / postmortem autopsy / XRT, vorinostat
+
+Further information about the **treatments**:
+
+- **DMSO (dimethyl sulfoxide)**: cells treated with this compound are considered the control of the experiment. 
+
+- **Panobinostat**: the plated cells were treated with 50nM of panobinostat. This drug is a Histone deacetylase (HDAC) inhibitor. 
+
+- **Marizomib**: the plated cells were treated with 20nM of marizomib. This drug is a proteasome inhibitor. 
+
+- **Panobinostat and Marizomib**: also called "combo", the plated cells were treated with both drugs (50nM of panobinostat and 20nM of marizomib).
+
+If we take a look at the table, we can appreciate that not all the cell lines studied have the same number of replicates nor treatments, as the cell type **DIPG13** only has one sample treated with **Marizomib 20nM**. We should consider whether it is appropriate to remove this sample, as we won't be able to identify changes in the expression due to the lack of information. 
+
+If we want to know about the experimental protocols used to treat the different cell lines, we can access the variables associated with technical factors:
+
+```{r}
+
+se$treatment_protocol_ch1[1]
+se$growth_protocol_ch1[1]
+se$extract_protocol_ch1[1]
+
+```
+
+```{r pheno, echo=FALSE}
+
+tmp <- data.frame("Identifier"=colnames(se),
+                    "Cell line"=se$`cell type:ch1`,
+                    "Treatment"=se$`agent:ch1`,
+                    "Group"=se$title,
+                    check.names=FALSE)
+kable(tmp, caption="**Phenotypic variables.** Each row shows a sample.") %>% kable_styling(position = "center")
+
+```
+
+Later on, we will use the group identifier (last column of table \@ref(tab:pheno)) to group together the samples with same cell line and treatment by deleting the number at the end. 
+
+
+## Sequencing depth 
+
+Figure \@ref(fig:libsizes) below shows the library size per sample in increasing order. They are coloured by cell type, as shown in the legend. 
+
+```{r libsizes, echo = FALSE, warning=FALSE, height=8, width=8, fig.cap="Library sizes. Samples are shown in increasing library size order and colored by cell type."}
+ord <- order(dge$samples$lib.size)
+
+palette(c("#484952", "#59b5b7", "#eac4bc"))
+barplot(dge$samples$lib.size[ord]/1e6, las=2, ylab="Millions of reads", xlab="", col=as.factor(se$`cell type:ch1`[ord]))
+title(xlab = "Samples", line = 1) 
+legend("topleft", legend = levels(as.factor(se$`cell type:ch1`[ord])), fill=as.factor(levels(as.factor(se$`cell type:ch1`[ord]))), title = "Cell type")
+
+```
+
+We can see a big difference in the sequencing depth of the cell line **DIPG-13** in comparison with the other samples, having almost twice as many reads as the rest. 
+
+For this reason, and since, as mentioned before, we only have one sample for this cell line with only one treatment, we decide to remove the **DIPG-13** sample from the analysis. 
+
+```{r }
+## remove DIPG13 sample
+mask <- se$title != "DIPG13-Mar2"
+se_wo13 <- se[, mask]
+dge_wo13 <- dge[, mask]
+print(unique(se_wo13$`cell type:ch1`)) ## we can see that DIPG13 is not in the new dataset
+print(dim(assay(se_wo13))) ## we have one less column 
+print(dim(dge_wo13))
+``` 
+
+## Distribution of expression levels among samples
+
+The Figure \@ref(fig:expdist) below shows the distribution of expression levels per sample, as logarithmic CPM. 
+
+```{r expdist, echo=FALSE, warning=FALSE, height=8, width=8, fig.cap="Distribution of expression levels among samples."}
+
+par(mfrow=c(1,2), mar=c(7, 5, 2, 2), xpd=TRUE)
+multidensity(as.list(as.data.frame(assays(se_wo13)$logCPM)),
+             xlab=expression(log[2]*"CPM"), legend=NULL, main="", cex.axis=1.2, cex.lab=1, las=1)
+
+
+palette(c("#59b5b7", "#eac4bc"))
+boxplot(assays(se_wo13)$logCPM, ylab=expression(log[2]*"CPM"), cex.axis=1.2, cex.lab=1, las=2, col=as.factor(se_wo13$`cell type:ch1`), xaxt = "n")
+legend(2.8, -5, legend = levels(as.factor(se_wo13$`cell type:ch1`)), fill=as.factor(levels(as.factor(se_wo13$`cell type:ch1`))), title = "Cell type")
+
+``` 
+There are no major differences in the expression distribution across the samples. 
+ 
+## Distribution of expression levels among genes
+
+Figure \@ref(fig:avgexp) below shows the distribution of average expression among genes.
+
+```{r, include=FALSE}
+avgexp <- rowMeans(assays(se_wo13)$logCPM)
+
+h = hist(avgexp, las=1, col="#1b98e0")
+```
+
+```{r avgexp, echo=FALSE, width=8, height=8, fig.cap="Distribution of average expression levels among genes." }
+plot(h, col="cadetblue1", xlab="Average expression (log2CPM)", main=NULL)
+``` 
+We see many lowly-expressed genes that need to be filtered in the next step. 
+
+## Filtering of lowly-expressed genes
+
+We will filter the lowly-expressed genes to avoid expression-dependent biases in the samples. To achieve this, we have decided to apply a cut-off value of 1 in all samples.
+
+```{r}
+mask <- rowMeans(assays(se_wo13)$logCPM) > 1
+se.filtered <- se_wo13[mask, ]
+dge.filtered <- dge_wo13[mask, ]
+dim(se.filtered)
+``` 
+
+```{r, include=FALSE}
+avgexp <- rowMeans(assays(se_wo13)$logCPM)
+
+h = hist(avgexp, las=1, col="#1b98e0")
+```
+
+```{r avgexp1, echo=FALSE, width=8, height=8, fig.cap="Distribution of average expression of genes after applying a cut-off. The cut-off is represented by the vertical line." }
+ccat = cut(h$breaks, c(-Inf, 0, Inf))
+
+plot(h, col=c("blanchedalmond","cadetblue1")[ccat], xlab="Average expression (log2CPM)", main=NULL)
+abline(v=1, lwd=2)
+legend("topright", c("Discarded genes", "Remaining genes"), fill=c("blanchedalmond", "cadetblue1"))
+``` 
+
+After the filtering we are left with 12326 genes.
+
+## Normalization
+
+Here we are going to take the data previously filtered and calculate the **normalization factors** in order to scale the raw library sizes. 
+
+It can be done using the function `calcNormFactors` from the `edgeR`package. The default method uses the **Trimmed Mean of M-values (TMM)** between all the sample pairs.
+
+```{r}
+dge.filtered <- calcNormFactors(dge.filtered)
+``` 
+
+Now we are going to replace the previously calculated **log2 CPM** for the normalized values:
+
+```{r}
+assays(se.filtered)$logCPM <- cpm(dge.filtered, log=TRUE,
+                              normalized.lib.sizes=TRUE)
+```
+
+## MA-plots
+
+**MA plots** are a very useful tool to assess the normalization results. They can be used to find differences between measurements taken in two different samples. 
+
+The figure \@ref(fig:MAplots) below shows the MA-plots for each sample, where **M** is the difference between the log intensity and the average and **A** is the average of the log intensity.
+
+
+```{r MAplots, echo = FALSE, fig.height=10, fig.width=10, fig.cap="MA plots of filtered and normalized expression values for each sample."}
+par(mfrow=c(4, 4), mar=c(4, 5, 3, 1))
+for (i in 1:ncol(se.filtered)) {
+  Mean_expression <- rowMeans(assays(se.filtered)$logCPM)
+  Distance_mean <- assays(se.filtered)$logCPM[, i] - Mean_expression
+  smoothScatter(Mean_expression, Distance_mean, main=se.filtered$title[i], las=1, xlab = "A", ylab = "M")
+  abline(h=0, col="blue", lwd=2)
+  lo <- lowess(Distance_mean ~ Mean_expression)
+  lines(lo$x, lo$y, col="red", lwd=2)
+}
+``` 
+
+Here we can see that by filtering has been well performed as we don't appreciate substantial bias in the expression values.
+
+## Experimental design and batch identification
+
+To assess whether there is a possible **batch effect** that should be addressed, we will take a look into the details of the experimental design:
+
+```{r sampledist, echo=FALSE}
+kable(table(se.filtered$`agent:ch1`, se.filtered$`cell type:ch1`), caption = "**Number of samples for each cell type and treatment.** Columns show sample cell line and rows show sample treatment.") %>%  kable_styling(position = "center")
+``` 
+
+As we have commented before, the number of samples studied is the same for each condition.
+
+```{r protocol, echo=FALSE}
+kable(table(se.filtered$extract_protocol_ch1, se.filtered$`cell type:ch1`), caption = "**Number of samples for each cell type and experimental protocol.** Columns show sample cell line and rows show experimental protocol") %>%  kable_styling(position = "center")
+```
+If we retrieve the experimental protocols by which the data was obtained, we also establish that all the cells underwent the same conditions and processes.
+
+
+In order to assess in a visual way if there is **batch effect** we can compute:
+
+- Hierarchical clustering
+- MDS Plot
+
+**Hierarchical clustering of samples:**
+
+We will need to group the samples by their treatment and cell type so we have decided to create a new variable called groupname that contains this information:
+
+```{r}
+## group by cell type and treatment
+se.filtered$groupname <- factor(unname(sapply(se.filtered$title, function(x) gsub("-", ".", substring(x, 1, nchar(x)-1)))))
+se.filtered$groupname
+table(se.filtered$groupname)
+```
+
+After this, we can use this new label to identify the samples in further analysis, such as the hierarchical clustering: 
+
+```{r sampleClustering, fig.height=5, fig.width=8, dpi=100, echo=FALSE, fig.cap="Hierarchical clustering of the samples. Labels correspond to sample group, while colors indicate sample cell type."}
+logCPM <- cpm(dge.filtered, log=TRUE, prior.count=3)
+d <- as.dist(1-cor(logCPM, method="spearman"))
+sampleClustering <- hclust(d)
+batch <- as.factor(se.filtered$`cell type:ch1`)
+sampleDendrogram <- as.dendrogram(sampleClustering, hang=0.1)
+levels(batch) <- c("#59b5b7", "#B35F9C")
+names(batch) <- colnames(se.filtered)
+outcome <- se.filtered$groupname
+names(outcome) <- colnames(se.filtered)
+sampleDendrogram <- dendrapply(sampleDendrogram,
+                               function(x, batch, labels) {
+                                 if (is.leaf(x)) {
+                                   attr(x, "nodePar") <- list(lab.col=as.vector(batch[attr(x, "label")]))
+                                   attr(x, "label") <- as.vector(labels[attr(x, "label")])
+                                 }
+                                 x
+                               }, batch, outcome)
+plot(sampleDendrogram, main="",
+     cex=0.7)
+```
+
+
+**MDS plot:**
+
+```{r MDSplot, fig.height=5, fig.width=8, dpi=100, echo=FALSE, fig.cap="MDS plot of the samples. Labels indicate sample group, while colors indicate sample cell type."}
+par(mar=(c(7, 5, 2, 2)), xpd=TRUE)
+outcome <- se.filtered$groupname
+names(outcome) <- colnames(se.filtered)
+plotMDS(dge.filtered, labels=outcome, col=as.vector(batch))
+legend(2, 0.5, legend = levels(as.factor(se.filtered$`cell type:ch1`)), fill=as.vector(levels(batch)), inset=0.05)
+```
+
+As we can see in the figure \@ref(fig:sampleClustering) and \@ref(fig:MDSplot), the cell lines (**QCTB-R059** and **SU-DIPG-6**) are clearly differentiated in two clusters according to the 1st dimension. Moreover, we can see how in both cell lines (**QCTB-R059** and **SU-DIPG-6**) there is a clear separation between treatments, where **Control** and **Marizomib** treatments group together forming a cluster and **Panobinostat** and **Panobinostat & Marizomib (Combo)** form another cluster. 
+
+# Differential expression
+
+To further explore the effect of the different treatments in the cell lines, we are going to identify the **genes differential expressed** between the treatment cells in respect to the control samples. To perform this study we are applying a **factorial design approach**, as we want to make multiple pairwise comparisons between the same cell type. 
+
+First of all, we need to create a model matrix taking into account both cell type and treatment as covariates, already encoded in the previously created variable 'groupname'. Then, a model is fitted with the function 'glmQLFit()', from 'EdgeR' to prepare the model to conduct genewise statistical tests for a given coefficient or contrast. The last step is to create a contrast matrix, where we specify all the comparisons between groups we want to perform.
+
+
+```{r}
+co <- se.filtered$groupname
+mod <- model.matrix(~ 0 + co, colData(se.filtered))
+dge.filtered <- estimateDisp(dge.filtered, mod)
+fit <- glmQLFit(dge.filtered, mod)
+
+cont.matrix <- makeContrasts(DIPG6.Mar=coDIPG6.Mar-coDIPG6.Control,
+                             DIPG6.Pano=coDIPG6.Pano-coDIPG6.Control,
+                             DIPG6.Combo=coDIPG6.Combo-coDIPG6.Control,
+                             R059.Mar=coR059.Mar-coR059.Control,
+                             R059.Pano=coR059.Pano-coR059.Control,
+                             R059.Combo=coR059.Combo-coR059.Control,
+                             levels=mod)
+                             
+```
+
+Once we have built our model, we need to extract the relevant information for our analysis. Below can be found different plots that help us understand the differences in expression between the compared samples. We considered significant differential expressed genes those with a p-value lower than 0.001. The p-value distributions show how many differential expressed genes are found in the treatment samples when compared against the control, as the distributions are generally skewed to the left, we can establish that the proportion of differential expressed genes is very high in the treatment samples. Moreover, the volcano plots show the proportion of how many of those genes are up-regulated or down-regulated gene. Furthermore, we have labeled the top 7 more significant genes in every sample, being these the ones with lower p-value.
+
+```{r DEplots, echo=FALSE, fig.height=20, fig.width=8, fig.cap="P-value distributions and volcano plots for each sample group against control. P-value distributions are colored by treatment. Volcano plots are colored as follows: significant down-regulated genes in red, significant up-regulated genes in green, non-significant genes in grey and top 7 genes with lower p-value in blue and labeled."}
+results_df <- data.frame(group=c(), DE_number=c())
+par(mfrow=c(6, 2))
+tt_list <- vector(mode="list", length = 6)
+qlf_list <- vector(mode="list", length = 6)
+col_v <- c("#FFA06E", "#C9FF66", "#C6BEBE", "#FFA06E", "#C9FF66", "#C6BEBE")
+main_v <- c("DIPG6-Marizomib", "DIPG6-Panobinostat", "DIPG-Combination", "R059-Marizomib", "R059-Panobinostat", "R059-Combination")
+
+for (i in 1:ncol(cont.matrix)) {
+qlf <- glmQLFTest(fit, contrast=cont.matrix[,i])
+tt <- topTags(qlf, n=Inf, adjust.method = "BH")
+
+#save the qlf objects
+qlf_list[[i]] <- qlf
+names(qlf_list)[i] <- main_v[i]
+
+#creation of 6 different DE genes lists
+tt_list[[i]] <- tt
+names(tt_list)[i] <- main_v[i]
+
+results_df[i, "group"] = colnames(cont.matrix)[i]
+results_df[i, "DE_number"]=sum(tt$table$FDR < 0.001)
+
+hist(tt$table$FDR, xlab="Adjusted p-values (FDR)", las=1, main=main_v[i], col=col_v[i])
+
+de_mask <- tt$table$logFC != 0 & tt$table$FDR < 0.001
+de_genes_table <- tt$table[de_mask, ]
+top7 <- head(de_genes_table[order(de_genes_table$FDR), ], 7)
+results_df[i, "top7"] = paste(top7$symbol, collapse = ", ")
+
+notsig <- tt$table[tt$table$FDR>0.001,]
+upreg <- tt$table[tt$table$logFC>0,]
+downreg <- tt$table[tt$table$logFC<0,]
+
+plot(tt$table$logFC, -log10(tt$table$FDR), main=main_v[i], xlab="LogFC", ylab="-log10(P-value)", ylim = c(0, 12.5), xlim=c(-8, 10), pch=20)
+
+points(upreg$logFC, -log10(upreg$FDR), col="#9DFF93", pch=20)
+points(downreg$logFC, -log10(downreg$FDR), col="#FF8F96", pch=20)
+points(notsig$logFC, -log10(notsig$FDR), col="grey", pch=20)
+points(top7$logFC, -log10(top7$FDR), col="blue", pch=20)
+text(top7$logFC, -log10(top7$FDR), labels=top7$symbol, cex= 0.7, pos=3)
+}
+  
+```
+
+A trend can be appreciated in all 6 comparisons, with similar p-value distributions and volcano plot shapes. In the last ones we can see separated by colors the non-significant genes (gray points), the up-regulated ones (green points) and the down-regulated (red points). We find more divergence regarding the top 7 differential expressed genes, as they are up-regulated or down-regulated depending on the sample. At first glance, we see a more clear difference between cell types than between treatments, regarding the over or under expression of those top differential expressed genes.
+
+```{r DEresults, echo=FALSE, message=FALSE, warning=FALSE}
+library(tidyr)
+
+test_df <- data.frame(Var1=as.factor(c("Down", "NotSig", "Up")))
+
+for (i in 1:length(qlf_list)){
+
+  test <- as.data.frame(summary(decideTestsDGE(qlf_list[[i]], p.value = 0.001))) %>% spread(Var2, Freq)
+  names(test)[2] <- colnames(cont.matrix)[i]
+  test_df <- merge(test_df, test, by="Var1")
+  
+}  
+
+rownames(test_df) <- c("Down-regulated", "Not Significant", "Up-regulated")
+test_df <- subset(test_df, select = -Var1)
+kable(test_df, caption = "**Amount of differential expressed genes sorted by quantity of expression**") %>% kable_styling(position = "center")
+```
+
+In table \@ref(tab:DEresults) we can see the results per group of the **Differential Expression** analysis. For each group we can see the number of genes **up-regulated**, **down-regulated** and **non-significant**.
+
+As we want to focus on the genes **up-regulated** and **down-regulated** we will create a second table with only them (getting rid of the **non-significant**) and showing for each case the top 7 DE genes (the ones with lower p-value).
+
+```{r DEgenes, echo=FALSE, message=FALSE, warning=FALSE}
+kable(results_df, col.names = c("Sample group", "Amount of DE genes", "Top 7 DE genes"), caption="<b>Results of the differential expression analysis.</b> The table shows the results of the differential expression analysis of each sample group compared to the corresponding control group. The amount of DE genes are computed as the ones with FDR < 0.05. Top 7 DE genes are the ones with lower p-value.", format = "html") %>% kable_styling(position = "center")
+```
+
+In table \@ref(tab:DEgenes) can be found the **top 7 differential expressed genes** for each comparison between the treatments and the controls. We can appreciate that for each group the amount of differential expressed (DE) genes is in the order of the thousands. 
+
+From this table we see different interesting things:
+
+* The highest and lowest number of DE genes are found on the cell line SU-DIPG-6. The **Combination** treatment for this certain cell line is the top scorer with **5189 DE genes** and **Marizomib** treatment the lowest scorer with **1971 DE genes**. It is interesting to see that variation within treatments in this cell line is greater than in the other cell line, QCTB-R059.
+
+* The 2 higher number of DE genes are the ones corresponding to the **Combination** treatment  (**5189 DE genes for SU-DIPG-6** and **4903 DE genes for QCTB-R059**). When applying this treatment the number of DE genes is greater than with other treatments, no matter the cell type.
+
+After carefully checking the previous table and searching for common genes for each pairwise combination of treatments (only taking into account the top 7 genes present in the previous table), we can see the following common genes: 
+
+- Common DE genes in DIPG6-Marizomib and in R059-Marizomib: PTPRN
+- Common DE genes present in DIPG6-Panobinostat and in R059-Panobinostat: DHRS2, YBX2
+- No common DE genes in DIPG6-Combination and R059-Combination.
+
+Here we can find those genes that are repeated between cell lines when applying the same treatment. 
+
+For the **Marizomib** treatment we only have one common DE gene:
+
+- **PTPRN**: this gene encodes for the protein Tyrosine phosphatase receptor type N. This protein has an important role in the **regulation of the secretion pathways** of various neuroendocrine cells. It has been found in literature [@wang] that the **down-regulation** of it **reduced the proliferation and migration of glioma cells**, while its **up-regulation** produced the reversed effect, **inducing the proliferation of the glioma cells**. The authors finally state that reducing the expression of PTPRN could be used as a therapeutic strategy in glioma cells.
+
+For the **Panobinostat** treatment we have two common DE genes:
+
+- **DHRS2** : It may be considered an interesting case as these gene is found to be described by previous authors [@zhou] as a gene with a **tumor suppressing role**.
+
+- **YBX2**: it encodes for the protein Y-box binding protein 2. It has been previously associated with properties of germ and cancer cells. Some authors [@suzuki] hypothesize that this gene may contribute to the characteristics of cancer stem cells. Whereas we couldn’t find specific bibliography relating YBX2 with glioma, we found an interesting article [@gong] relating  YBX1 with glioma. **YBX1** encodes for Y-box binding protein 1 (a protein from the same family) and its **overexpression is associated with the progression of glioma** with an influence in patient survival. 
+
+# Functional analysis
+
+In this part of our analysis we are going to identify the **enriched genes** in the samples. In order to do it we are going to follow a **Gene Set Enrichment Analysis** methodology.
+
+In order to retrieve a data object containing the gene sets and their member genes, we are going to use the library [msigdbr](https://cran.r-project.org/web/packages/msigdbr/vignettes/msigdbr-intro.html). We are going to use the hallmark gene sets, to retrieve the principal pathways in which our DE genes are involved and see what processes are more affected by the different treatments in the samples.
+
+```{r}
+h_gene_sets = msigdbr(species = "human", category = "H")
+head(h_gene_sets)
+```
+
+Now we are going to use the library [fgsea](https://bioconductor.org/packages/release/bioc/vignettes/fgsea/inst/doc/fgsea-tutorial.html) to generate the **GSEA** plots. This will allow us to check the genes ranked per pathway, for each of the 6 samples that we have got. In order to get just a representative selection, we only select the **20 values** that have the lowest p-values and then we order it by the **Normalized Enrichment Score (NES)**. 
+
+The **Enrichment Score (ES)** is the degree to which a certain gene set is over-represented at the top or bottom of the ranked list of genes in the expression dataset.
+
+The **NES** is an statistic for checking gene set enrichment results. It is basically a normalization of the **ES**, and with that it takes into account differences in gene set size and in-correlations between gene sets and expression data set.
+
+```{r warning=FALSE, include=FALSE}
+msigdbr_list = split(x = h_gene_sets$entrez_gene, f = h_gene_sets$gs_name)
+gsets <- h_gene_sets$gs_id
+
+stats_list <- vector(mode="list", length = 6)
+fgseares_list <- vector(mode="list", length = 6)
+topPathways_list <- vector(mode="list", length = 6)
+
+for (i in 1:length(tt_list)){
+  
+stats<- tt_list[[i]]$table$logFC
+names(stats) <- rownames(tt_list[[i]]$table)
+stats_list[[i]] <- stats
+names(stats_list)[i] <- main_v[i]
+
+fgseares <- fgsea(pathways = msigdbr_list, stats, minSize=5, maxSize=300)
+fgseares_list[[i]] <- fgseares
+names(fgseares_list)[i] <- main_v[i]
+
+topPathways <- fgseares[head(order(pval), n=20)][order(NES), pathway] # get the lower 20 pvalues and then order by NES
+topPathways_list[[i]] <- topPathways
+names(topPathways_list)[i] <- main_v[i]
+
+}
+```
+
+
+```{r GSEA1, fig.cap="GSEA results for DIPG6-Marizomib. Figure shows Top 20 gene sets with lowest p-value, ordered by NES.", echo=FALSE}
+plotGseaTable(pathways = msigdbr_list[topPathways_list[[1]]], stats_list[[1]], fgseares_list[[1]])
+```
+
+```{r GSEA2, fig.cap="GSEA results for DIPG6-Panobinostat. Figure shows Top 20 gene sets with lowest p-value, ordered by NES.", echo=FALSE}
+plotGseaTable(pathways = msigdbr_list[topPathways_list[[2]]], stats_list[[2]], fgseares_list[[2]])
+```
+
+```{r GSEA3, fig.cap="GSEA results for DIPG6-Combination. Figure shows Top 20 gene sets with lowest p-value, ordered by NES.", echo=FALSE}
+plotGseaTable(pathways = msigdbr_list[topPathways_list[[3]]], stats_list[[3]], fgseares_list[[3]])
+```
+
+```{r GSEA4, fig.cap="GSEA results R059-Marizomib. Figure shows Top 20 gene sets with lowest p-value, ordered by NES.", echo=FALSE}
+plotGseaTable(pathways = msigdbr_list[topPathways_list[[4]]], stats_list[[4]], fgseares_list[[4]])
+```
+
+```{r GSEA5, fig.cap="GSEA results R059-Panobinostat. Figure shows Top 20 gene sets with lowest p-value, ordered by NES.", echo=FALSE}
+plotGseaTable(pathways = msigdbr_list[topPathways_list[[5]]], stats_list[[5]], fgseares_list[[5]])
+```
+
+```{r GSEA6, fig.cap="GSEA results R059-Combination. Figure shows Top 20 gene sets with lowest p-value, ordered by NES.", echo=FALSE}
+plotGseaTable(pathways = msigdbr_list[topPathways_list[[6]]], stats_list[[6]], fgseares_list[[6]])
+```
+
+In the graphs above (figures \@ref(fig:GSEA1), \@ref(fig:GSEA2), \@ref(fig:GSEA3), \@ref(fig:GSEA4), \@ref(fig:GSEA5), \@ref(fig:GSEA6)) we find the 20 pathways with the lowest p-values in which our differential expressed genes are involved, ordered by their Normalized Enrichment Score (NES). There is a graph for each sample that we are working with, and the sign of the NES score indicates the direction of the expression: if it is negative the pathway is down-regulated and if it is positive, the pathway is up-regulated.
+
+Between all samples we can find common hallmark pathways down-regulated, such as E2F transcription factors and G2M checkpoint components. On the contrary, we find up-regulated pathways such as p53, TNFA via NFkB, Apoptosis and Hypoxia. These pathways are involved in the maintenance of cell viability and its proliferation, the down-regulated ones are typically involved in cell proliferation, while the up-regulated ones adopt more of a tumor suppressing role. These pathways are very extensive and are involved also in many different cellular processes, it is kind of expected that they are affected by all treatments. 
+
+Regarding the differences between treatments, we have noted that we find down-regulated the MYC targets pathway only in the cells treated with Panobinostat and Combination. This pathway is, again, involved in many cellular processes such as cell proliferation (c-Myc is a known oncogene), maturation and death and its differential expression is maintained between both cell lines with the same treatments. 
+
+Also it is worth noting the presence of the Unfolded Protein Response (UPR) as up-regulated in QCTB-R059 cells treated with Marizomib and Combination. This pathway is conformed of genes that are typically up-regulated during the response of unfolded proteins, a cellular stress response related to the endoplasmic reticulum. Interestingly, this is not found differentially expressed in any SU-DIPG-6 cell samples.
+
+
+
+
+# Discussion
+
+Taking into account the results obtained by our analysis, we can highlight some important points to understand the expression landscape of the studied cancer samples. In relation to the amount of differential expressed genes sorted by quantity of expression (table \@ref(tab:DEresults)), we can see that between cell lines (comparing the same treatment between cell lines), there are not a lot of differences in the amount of differential expressed genes, with the exception of marizomib. The majority of differences in the amount of differential expressed genes are seen when comparing treatments within the same cell line. When comparing the amount of DE genes within the same cell line (comparing the treatments), we can see how combination treatment had the highest amount of significant differentially expressed genes (down-regulated and up-regulated). In SU-DIPG-6, the treatment with less significant DE genes was with only marizomib, but in QCTB-R059, the treatment with less significant DE genes was panobinostat. 
+
+Having said that, we can see how the marizomib treatment in QCTB-R059 has much more down-regulated genes compared to the marizomib treatment in SU-DIPG-6 (2341 and 949 respectively). This difference may happen because of the difference in cell type. SU-DIPG-6 cells were obtained in early postmortem autopsy from a DIPG grade III tumor in the pons, and had the TP53 and H3.3K27M mutated. However, QCTB-R059 cells were obtained in a surgical resection from a pediatric glioblastoma in the thalamus and only had H3.3K27M mutated. Moreover, the patient from which the SU-DIPG-6 cells where obtained had been previously treated with selective adjuvant radiotherapy and vorinostat (inhibitor of histone deacetylase). Knowing that the nature of the patient-derived cell lines could explain the differences found between treatments, it would be interesting to obtain more samples of different glioma patients and include them in our analysis.
+
+Regarding our results and the ones in the original paper, we have found some common findings in the **differential expressed pathways** in both cell lines. As we have mentioned earlier in the functional analysis part, we see many pathways related to **cell proliferation** affected by the treatments. This effect was kind of expected, as we are working with patient-derived cancer cell lines, the treatments will increase the expression of tumor suppressing pathways and down-regulate the oncogenic ones.
+
+In the original publication, Lin et al. find a consistent up-regulation of the UPR gene set in the samples treated with Marizomib and Combination across patient-derived cultures. Our results are partially consistent with this finding, as we also found an up-regulation of this gene set in the Marizomib and Combination QCTB-R059 samples (figures \@ref(fig:GSEA4), \@ref(fig:GSEA6)), but we didn’t find it between the top 20 differentially expressed gene sets in the SU-DIPG-6 samples (figures \@ref(fig:GSEA1), \@ref(fig:GSEA3)). Other proteasome inhibitors such as Bortezomib, have been shown to promote the up-regulation of components in the unfolded protein response (UPR) due to the induction of stress in the endoplasmic reticulum [@mujtaba]. Marizomib, also a proteasome inhibitor, could act in a similar way, as we have reported an upregulation of this gene set in half of the samples treated with Marizomib. 
+
+Along with the previous finding, we found a down-regulation of the oxidative phosphorylation gene sets in the combination samples of both cell lines (figures \@ref(fig:GSEA3), \@ref(fig:GSEA6)), which is also a highlighted finding in the original paper. This down-regulation is only present in the combination samples and it is not differentially expressed in samples treated with only Panobinostat or Marizomib. This fact could pinpoint the down-regulation of the oxidative phosphorylation gene set to a **synergic effect** of the combination of both treatments, rather than their separate effects.
+
+Interestingly, we also found a cell proliferation pathway (hallmark Myc targets) that appeared differentially expressed (down-regulated) in only Panobinostat and Combination samples in both cell lines (figures \@ref(fig:GSEA2), \@ref(fig:GSEA3), \@ref(fig:GSEA5), \@ref(fig:GSEA6)). Although the effect of histone deacetylases inhibitors like Panobinostat in c-Myc expression has not yet been fully understood, there have been reports where the addition of Panobinostat down-regulated the Myc expression in cancer cells [@nebbioso]. These reports are consistent with our results, as in all samples treated with Panobinostat or in combination with Marizomib show down-regulation of hallmark Myc targets.
+
+
+
+# Conclusions
+
+Diffuse midline gliomas and diffuse intrinsic pontine gliomas are known for being lethal childhood cancers without an effective treatment. Here, we studied the expression profiles of some patient-derived cell lines treated with experimental drugs and identified the principal gene sets affected by them. Our observations direct us to believe that the combination of Marizomib and Panobinostat lead SU-DIPG-6 and QTCB-R059 cells to metabolic collapse. Our GSEA enrichment results show a down-regulation of known oncogens (E2F, MYC) and oxidative phosporylation gene sets in the samples treated with the drug combination, as well as changes in expression of cell cycle and apoptosis related gene sets which is consistent with the results reported in the paper. The original study also includes extra experimental assays to verify the cytotoxic effects of this treatment on Diffuse Midline Glioma cells, which we have not reproduced. These assays demonstrate that glioma cells are sensitive to metabolic dysregulation and that metabolic collapse is one of the main causes of cytotoxicity of this treatment on glioma cells. 
+
+To further assess the benefits of combining both drugs to treat diffuse midline gliomas, another control of healthy cells could be added to the analysis. The comparison of treated tumor cells with treated healthy cells would determine whether the treatment effect is specific for tumor cells or affects all cells equally.Moreover, additional research on this topic may also include extending the analysis to more patients with both similar and different tumor features (for instance, different tumor grade or different genetic background). That would be useful to validate the current results and to check any differences in the treatment effect due to different kinds of tumor. 
+
+As we have remarked before, there is not a specific nor effective treatment to deal with this kind of cancers, so it is very important to develop combinational drug strategies to treat them. Here we pinpoint the combination of Marizomib and Panobinostat as a promising new therapy in hopes to accelerate the process of finding an effective treatment for this disease. 
+
+
+# Session information
+
+```{r}
+sessionInfo()
+```
+
+# References
